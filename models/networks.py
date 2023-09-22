@@ -26,5 +26,43 @@ class NGP(nn.Module):
         b = np.exp((N_max/N_min)/(L-1))
         print(f'GridEncoding: Nmin={N_min}, Nmax={N_max}, b={b:.5f} F={F}, L={L}, T=2^{log2_T}')
 
-        self.xyz_encoder = \
-            tcnn.NetworkWithInputEncoding()
+        self.xyz_encoder = tcnn.NetworkWithInputEncoding(  
+                                            n_input_dims=3, 
+                                            n_output_dims=16,
+                                            encoding_config={
+                                                "otype": "Grid",
+                                                "type": "Hash",
+                                                "n_levels": L,
+                                                "n_features_per_level": F,
+                                                "log2_hashmap_size": log2_T,
+                                                "base_resolution": N_min,
+                                                "per_level_scale": b,
+                                                "interpolation": "Linear"
+                                            },
+                                            network_config={
+                                                "otype": "FullyFusedMLP",
+                                                "activation": "ReLU",
+                                                "output_activation": "None",
+                                                "n_neurons": 64,
+                                                "n_hidden_layers": 1,
+                                            }
+            )
+        
+
+        self.dir_encoder = tcnn.Encoding(   n_input_dims=3, 
+                                            encoding_config={
+                                                "otype": "SphericalHarmonics",
+                                                "degree": 4,
+                                            },
+            )
+        
+
+        self.rgb_net = tcnn.Network(    n_input_dims=32, n_output_dims=3,
+                                        network_config={
+                                            "otype": "FullyFusedMLP",
+                                            "activation": "ReLU",
+                                            "output_activation": self.rgb_act,
+                                            "n_neurons": 64,
+                                            "n_hidden_layers": 2,
+                                        }
+        )

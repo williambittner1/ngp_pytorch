@@ -1,0 +1,6 @@
+# ninja log v5
+0	19716	1695314419030868600	/media/hyunjun/NewDisk/William/ngp_pytorch/models/csrc/build/temp.linux-x86_64-cpython-38/binding.o	16cecd6259d257e7
+1	43365	1695314442678291400	/media/hyunjun/NewDisk/William/ngp_pytorch/models/csrc/build/temp.linux-x86_64-cpython-38/raymarching.o	95047a5cb319f826
+1	43933	1695314443258797100	/media/hyunjun/NewDisk/William/ngp_pytorch/models/csrc/build/temp.linux-x86_64-cpython-38/intersection.o	71a68dc5d5086085
+1	47250	1695314446574543600	/media/hyunjun/NewDisk/William/ngp_pytorch/models/csrc/build/temp.linux-x86_64-cpython-38/volumerendering.o	ccc31a44d6c0e23e
+1	51145	1695314450469862100	/media/hyunjun/NewDisk/William/ngp_pytorch/models/csrc/build/temp.linux-x86_64-cpython-38/losses.o	b06527fd73b2f659
