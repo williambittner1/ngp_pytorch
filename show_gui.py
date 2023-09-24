@@ -9,6 +9,9 @@ import dearpygui.dearpygui as dpg
 from einops import rearrange
 from train import depth2img
 from datasets import dataset_dict
+from models import render
+from datasets.ray_utils import get_ray_directions, get_rays
+
 
 class OrbitCamera:
     def __init__(self, K, img_wh, r):
@@ -69,7 +72,7 @@ class NGPGUI:
 
         # TODO: set these attributes by gui
         if self.hparams.dataset_name in ['colmap', 'nerfpp']:
-            exp_step_factor = 1/256
+            exp_step_factor = 1/256 
         else: exp_step_factor = 0
 
         results = render(self.model, 

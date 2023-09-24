@@ -2,6 +2,11 @@ import torch
 from torch import nn
 import numpy as np
 import tinycudann as tcnn
+from einops import rearrange
+import vren
+
+from .rendering import NEAR_DISTANCE
+
 
 class NGP(nn.Module):
 
@@ -66,3 +71,163 @@ class NGP(nn.Module):
                                             "n_hidden_layers": 2,
                                         }
         )
+
+
+    def log_radiance_to_rgb(self, log_radiances, **kwargs):
+        """
+        Convert log-radiance to rgb as the setting in HDR-NeRF.
+        Called only when self.rgb_act == 'None' (with exposure)
+        
+        Inputs: 
+            log_radiances: (N, 3)
+
+        Outputs: 
+            rgbs: (N, 3)
+        """
+
+        if 'exposure' in kwargs:
+            log_exposure = torch.log(kwargs['exposure'])
+        else: # unit exposure by default
+            log_exposure = 0
+
+        out = []
+        for i in range(3):
+            inp = log_radiances[:, i:i+1] + log_exposure
+            out += [getattr(self, f'tonemapper_net_{i}')(inp)]
+        rgbs = torch.cat(out, 1)
+        return rgbs
+
+
+    @torch.no_grad()
+    def get_all_cells(self):
+        """
+        Get all cells from the density grid
+
+        Outputs:
+            cells: a list (of length self.cascades) of indices and coords selected at each cascade
+        """
+        indices = vren.morton3d(self.grid_coords).long()
+        cells = [(indices, self.grid_coords)] * self.cascades
+        return cells
+    
+
+
+    @torch.no_grad()
+    def mark_invisible_cells(self, K, poses, img_wh, chunk=64**3):
+        """
+        Mark the cells that aren't covered by the cameras with density -1 
+        Only executed once before training starts
+    
+        The mark_invisible_cells method in the NeRFModel class is used to mark the cells in the 
+        3D grid that are not covered by any camera with a density value of -1. It computes the 
+        rotation and translation matrices that transform the world coordinates to camera 
+        coordinates, and checks if each cell is visible by at least one camera and not too 
+        close to any camera. By marking the invisible cells with a density value of -1, the 
+        method ensures that the NeRF model does not try to render images from these cells during 
+        the training process.
+        
+        Inputs:
+            K: (3, 3) camera intrinsics
+            poses: (N, 3, 4) camera to world poses
+            img_wh: image width and height
+            chunk: the chunk size to split the cells (to avoid Out of memory)
+        """
+        N_cams = poses.shape[0]
+        self.count_grid = torch.zeros_like(self.density_grid)
+        w2c_R = rearrange(poses[:, :3, :3], 'n a b -> n b a') # (N_cams, 3, 3)
+        w2c_T = -w2c_R@poses[:, :3, 3:] # (N_cams, 3, 1)
+        cells = self.get_all_cells()
+        for c in range(self.cascades):
+            indices, coords = cells[c]
+            for i in range(0, len(indices), chunk):
+                xyzs = coords[i:i+chunk]/(self.grid_size-1)*2-1
+                s = min(2**(c-1), self.scale)
+                half_grid_size = s/self.grid_size
+                xyzs_w = (xyzs*(s-half_grid_size)).T # (3, chunk)
+                xyzs_c = w2c_R @ xyzs_w + w2c_T # (N_cams, 3, chunk)
+                uvd = K @ xyzs_c # (N_cams, 3, chunk)
+                uv = uvd[:, :2]/uvd[:, 2:] # (N_cams, 2, chunk)
+                in_image = (uvd[:, 2]>=0)& \
+                           (uv[:, 0]>=0)&(uv[:, 0]<img_wh[0])& \
+                           (uv[:, 1]>=0)&(uv[:, 1]<img_wh[1])
+                covered_by_cam = (uvd[:, 2]>=NEAR_DISTANCE)&in_image # (N_cams, chunk)
+                # if the cell is visible by at least one camera
+                self.count_grid[c, indices[i:i+chunk]] = \
+                    count = covered_by_cam.sum(0)/N_cams
+
+                too_near_to_cam = (uvd[:, 2]<NEAR_DISTANCE)&in_image # (N, chunk)
+                # if the cell is too close (in front) to any camera
+                too_near_to_any_cam = too_near_to_cam.any(0)
+                # a valid cell should be visible by at least one camera and not too close to any camera
+                valid_mask = (count>0)&(~too_near_to_any_cam)
+                self.density_grid[c, indices[i:i+chunk]] = \
+                    torch.where(valid_mask, 0., -1.)
+
+    @torch.no_grad()    
+    def sample_uniform_and_occupied_cells(self, M, density_threshold):
+        """
+        Sample both M uniform and occupied cells (per cascade)
+        occupied cells are sample from cells with density > @density_threshold
+        
+        Outputs:
+        cells: list (of length self.cascades) of indices and coords selected at each cascade
+        """
+        cells = []
+        for c in range(self.cascades):
+            # uniform cells
+            coords_1 = torch.randint(self.grid_size, (M, 3), dtype=torch.int32, device=self.density_grid.device)
+            indices_1 = vren.morton3d(coords_1).long()
+            # occupied cells
+            indices_2 = torch.nonzero(self.density_grid[c]>density_threshold)[:, 0]
+            if len(indices_2) > 0:
+                rand_idx = torch.randint(len(indices_2), (M,), device=self.density_grid.device)
+                indices_2 = indices_2[rand_idx]
+            
+            coords_2 = vren.morton3d_invert(indices_2.int())
+            # concatenate
+            cells += [(torch.cat([indices_1, indices_2]), torch.cat([coords_1, coords_2]))]
+
+        return cells
+    
+
+    @torch.no_grad()
+    def update_density_grid(self, density_threshold, warmup=False, decay=0.95, erode=False):
+        """
+        Update the density grid by marking the cells with a density value lower than the threshold with -1
+
+        Inputs:
+            density_threshold: the density threshold
+            warmup: whether to use warmup mode
+            decay: the decay rate for warmup mode
+            erode: whether to erode the density grid
+        """
+
+        density_grid_tmp = torch.zeros_like(self.density_grid)
+
+        if warmup: # during the first steps
+            cells = self.get_all_cells()
+        else:
+            cells = self.sample_uniform_and_occupied_cells(self.grid_size**3//4, density_threshold)
+        
+        # infer sigmas
+        for c in range(self.cascades):
+            indices, coords = cells[c]
+            s = min(2**(c-1), self.scale)
+            half_grid_size = s/self.grid_size
+            xyzs_w = (coords/(self.grid_size-1)*2-1)*(s-half_grid_size)
+            # pick random position in the cell by adding noise in [-hgs, hgs]
+            xyzs_w += (torch.rand_like(xyzs_w)*2-1) * half_grid_size
+            density_grid_tmp[c, indices] = self.density(xyzs_w)
+
+        if erode:
+            # My own logic. decay more the cells that are visible to few cameras
+            decay = torch.clamp(decay**(1/self.count_grid), 0.1, 0.95)
+        self.density_grid = \
+            torch.where(self.density_grid<0,
+                        self.density_grid,
+                        torch.maximum(self.density_grid*decay, density_grid_tmp))
+
+        mean_density = self.density_grid[self.density_grid>0].mean().item()
+
+        vren.packbits(self.density_grid, min(mean_density, density_threshold),
+                      self.density_bitfield)
